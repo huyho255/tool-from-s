@@ -1,37 +1,88 @@
 #!/bin/bash
 
-STATUS_FILE="/tmp/vps_status.txt"
-FIRST_FAIL_FILE="/var/log/.vps_first_fail.timestamp"
-SERIAL=$(sudo /usr/sbin/dmidecode -s system-serial-number 2>/dev/null)
+# Bắt buộc chạy bằng quyền root
+if [ "$(id -u)" -ne 0 ]; then
+    echo "This script must be run as root." >&2
+    exit 1
+fi
 
-VPS_URL="http://13.214.142.47:8888"
+# ------------------ 0. CHỐNG CHẠY CHỒNG (FLOCK LOCKING) ------------------
+exec 9>/run/eda-control.lock
+flock -n 9 || exit 0
+
+# ------------------ THƯ MỤC TRẠNG THÁI BẢO MẬT (CHỐNG SYMLINK ATTACK) ------------------
+STATE_DIR="/var/lib/eda-control"
+STATUS_FILE="$STATE_DIR/status.txt"
+FIRST_FAIL_FILE="$STATE_DIR/first_fail.timestamp"
+
+mkdir -p "$STATE_DIR"
+chown root:root "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+
 TOOL_DIR_1="/opt"
+VPS_URL="http://13.214.142.47:8888"
 
-# ------------------ STEP 1: GỌI VPS & XỬ LÝ KHI MẤT MẠNG ------------------
-# Nếu curl thất bại (rớt mạng, VPS timeout) -> GIỮ NGUYÊN HIỆN TRẠNG & THOÁT NGAY
+# ------------------ 1. KIỂM TRA SERIAL ------------------
+SERIAL=$(/usr/sbin/dmidecode -s system-serial-number 2>/dev/null | tr -d '\r\n')
+
+if [ -z "$SERIAL" ]; then
+    echo "Error: Unable to retrieve system serial number." >&2
+    exit 1
+fi
+
+# ------------------ 2. REQUEST 1: CHECK STATUS ------------------
 if ! RESPONSE_STATUS=$(curl -fsS \
     --connect-timeout 5 \
     --max-time 10 \
     -G \
     --data-urlencode "serial=$SERIAL" \
     "${VPS_URL}/"); then
-    echo "VPS unreachable; keeping current tool state" >&2
+    echo "VPS status request failed; keeping current state" >&2
     exit 1
 fi
 
-# Kết nối thành công -> Mới ghi đè status mới nhất
-echo "$RESPONSE_STATUS" > "$STATUS_FILE"
-chmod 666 "$STATUS_FILE" 2>/dev/null
+# Ghi file trạng thái an toàn trong thư mục riêng của root
+printf '%s\n' "$RESPONSE_STATUS" > "$STATUS_FILE"
+chmod 600 "$STATUS_FILE"
 
-# ------------------ STEP 2: LỆNH TỰ HỦY CHỦ ĐỘNG TỪ VPS ------------------
-# Đã kết nối được VPS, hỏi trực tiếp xem có cờ Wipe chủ động không
-WIPE_RESP=$(curl -fsS --connect-timeout 5 --max-time 10 -G --data-urlencode "serial=$SERIAL" "${VPS_URL}/report_12h" 2>/dev/null)
+# ------------------ 3. STRICT MATCHING DÒNG ĐẦU (CHÍNH XÁC TUYỆT ĐỐI) ------------------
+# Lấy dòng đầu tiên và loại bỏ ký tự \r nếu có
+FIRST_LINE=$(printf '%s\n' "$RESPONSE_STATUS" | head -n1 | tr -d '\r')
 
+AUTH_STATE=""
+case "$FIRST_LINE" in
+    AUTHORIZED)
+        AUTH_STATE="approved"
+        ;;
+    "You are not approved"*)
+        AUTH_STATE="unapproved"
+        ;;
+    *)
+        echo "Unknown VPS response format; keeping current state" >&2
+        exit 1
+        ;;
+esac
+
+# ------------------ 4. REQUEST 2: CHECK WIPE (FAIL-SAFE CONTINUATION) ------------------
+WIPE_RESP=""
+if ! WIPE_RESP=$(curl -fsS \
+    --connect-timeout 5 \
+    --max-time 10 \
+    -G \
+    --data-urlencode "serial=$SERIAL" \
+    "${VPS_URL}/report_12h"); then
+    echo "Wipe-status request failed; continuing with authorization state" >&2
+    WIPE_RESP=""
+fi
+
+# 🚨 XỬ LÝ WIPE CHỦ ĐỘNG TỪ VPS (Chỉ thi hành nếu Request 2 thành công và trả về cờ Wipe)
 if [ "$WIPE_RESP" == "ACTION:WIPE_ALL_TOOLS" ]; then
-    chattr -R -i "$TOOL_DIR_1"/* 2>/dev/null
-    chown -R root:root "$TOOL_DIR_1" 2>/dev/null
-    chmod -R 777 "$TOOL_DIR_1" 2>/dev/null
-
+    chmod 755 "$TOOL_DIR_1" 2>/dev/null
+    
+    # Gỡ immutable từ sâu nhất lên nông (bottom-up), xử lý file con trước thư mục cha
+    find "$TOOL_DIR_1" -mindepth 1 -depth -exec chattr -i {} + 2>/dev/null
+    
+    # Xóa sạch gốc rễ
     rm -rf "$TOOL_DIR_1"/{*,.[!.]*,..?*} 2>/dev/null
     find "$TOOL_DIR_1" -mindepth 1 -delete 2>/dev/null
     
@@ -39,29 +90,36 @@ if [ "$WIPE_RESP" == "ACTION:WIPE_ALL_TOOLS" ]; then
     exit 0
 fi
 
-# ------------------ STEP 3: PHÂN LUỒNG TẠI MÁY (APPROVED / UNAPPROVED) ------------------
-if grep -q "You are not approved" "$STATUS_FILE" 2>/dev/null; then
+# ------------------ 5. XỬ LÝ THEO TRẠNG THÁI APPROVED / UNAPPROVED ------------------
+if [ "$AUTH_STATE" == "unapproved" ]; then
 
-    # ⏳ LUỒNG ĐẾM GIỜ 12H (TỰ ĐỘNG TỰ HỦY)
-    SERVER_TIME=$(grep "SERVER_TIME:" "$STATUS_FILE" | awk -F 'SERVER_TIME:' '{print $2}' | tr -d '\r\n')
+    # ⏳ LOGIC ĐẾM GIỜ 12H (CHỈ LẤY GIÁ TRỊ SERVER_TIME ĐẦU TIÊN)
+    SERVER_TIME=$(
+        printf '%s\n' "$RESPONSE_STATUS" |
+        grep -m1 -o 'SERVER_TIME:[0-9]\+' |
+        cut -d':' -f2
+    )
 
     if [[ "$SERVER_TIME" =~ ^[0-9]+$ ]]; then
         if [ ! -f "$FIRST_FAIL_FILE" ]; then
             echo "$SERVER_TIME" > "$FIRST_FAIL_FILE"
-            chmod 644 "$FIRST_FAIL_FILE"
+            chmod 600 "$FIRST_FAIL_FILE"
         fi
 
-        START_TIME=$(cat "$FIRST_FAIL_FILE" | tr -d '\r\n')
+        START_TIME=$(cat "$FIRST_FAIL_FILE" 2>/dev/null | tr -d '\r\n')
         
-        if [[ "$START_TIME" =~ ^[0-9]+$ ]]; then
+        # Chỉ xử lý khi START_TIME là số hợp lệ và SERVER_TIME không đi lùi
+        if [[ "$START_TIME" =~ ^[0-9]+$ ]] && [ "$SERVER_TIME" -ge "$START_TIME" ]; then
             ELAPSED=$((SERVER_TIME - START_TIME))
 
-            # Bị Unapproved liên tục quá 12 tiếng -> Tự động Wipe
+            # Bị Unapproved liên tục quá 12 tiếng (43200 giây)
             if [ "$ELAPSED" -ge 43200 ]; then
-                chattr -R -i "$TOOL_DIR_1"/* 2>/dev/null
-                chown -R root:root "$TOOL_DIR_1" 2>/dev/null
-                chmod -R 777 "$TOOL_DIR_1" 2>/dev/null
-
+                chmod 755 "$TOOL_DIR_1" 2>/dev/null
+                
+                # Gỡ immutable từ tầng sâu nhất lên nông
+                find "$TOOL_DIR_1" -mindepth 1 -depth -exec chattr -i {} + 2>/dev/null
+                
+                # Xóa sạch gốc rễ
                 rm -rf "$TOOL_DIR_1"/{*,.[!.]*,..?*} 2>/dev/null
                 find "$TOOL_DIR_1" -mindepth 1 -delete 2>/dev/null
                 
@@ -71,14 +129,14 @@ if grep -q "You are not approved" "$STATUS_FILE" 2>/dev/null; then
         fi
     fi
 
-    # 🔒 KHÓA QUYỀN /OPT KHI BỊ UNAPPROVED
-    [ -d "$TOOL_DIR_1" ] && chmod -R 000 "$TOOL_DIR_1" 2>/dev/null
+    # 🔒 KHÓA QUYỀN: CHỈ KHÓA THƯ MỤC GỐC /OPT (Giữ nguyên permission các file con)
+    [ -d "$TOOL_DIR_1" ] && chmod 000 "$TOOL_DIR_1" 2>/dev/null
 
 else
-    # 🔓 MỞ KHÓA: Trả lại quyền 711 cho /opt (Bảo mật, chặn ls soi thư mục)
-    [ -d "$TOOL_DIR_1" ] && chmod 711 "$TOOL_DIR_1" 2>/dev/null && chmod -R 755 "$TOOL_DIR_1"/* 2>/dev/null
+    # 🔓 MỞ KHÓA: Trả lại quyền 711 cho duy nhất thư mục gốc /opt
+    [ -d "$TOOL_DIR_1" ] && chmod 711 "$TOOL_DIR_1" 2>/dev/null
 
-    # Reset lại timestamp đếm phạt nếu đã trở lại ngoan (AUTHORIZED)
+    # Reset lại timestamp phạt khi đã khôi phục quyền thành công
     if [ -f "$FIRST_FAIL_FILE" ]; then
         rm -f "$FIRST_FAIL_FILE"
     fi
