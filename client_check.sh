@@ -7,12 +7,12 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # ------------------ 0. CHỐNG CHẠY CHỒNG (FLOCK LOCKING) ------------------
-exec 9>/run/eda-control.lock
+exec 9>/run/sys-state.lock
 flock -n 9 || exit 0
 
 # ------------------ THƯ MỤC TRẠNG THÁI BẢO MẬT ------------------
-STATE_DIR="/var/lib/eda-control"
-STATUS_FILE="$STATE_DIR/status.txt"
+STATE_DIR="/var/lib/sys-state"
+STATUS_FILE="$STATE_DIR/status"
 FIRST_FAIL_FILE="$STATE_DIR/first_fail.timestamp"
 
 mkdir -p "$STATE_DIR"
